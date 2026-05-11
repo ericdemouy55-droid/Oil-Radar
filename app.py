@@ -241,7 +241,7 @@ with st.sidebar:
 
 with st.spinner("Chargement des données marché..."):
     frames = load_market_data()
-    if all(df.empty for df in frames.values()):
+if all(df.empty for df in frames.values()):
     st.error("Impossible de récupérer les données marché (Yahoo Finance). Réessaie dans quelques secondes.")
 snapshot = market_snapshot(frames)
 news_scores = pd.DataFrame()
