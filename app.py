@@ -20,7 +20,7 @@ REFRESH_MINUTES = 30
 TICKERS = {
     "Brent": "BZ=F",
     "WTI": "CL=F",
-    "Dollar Index": "DX-Y.NYB",
+    "Dollar Index": "DX=F",
     "VIX": "^VIX",
 }
 
