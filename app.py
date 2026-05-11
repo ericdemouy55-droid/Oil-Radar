@@ -241,7 +241,8 @@ with st.sidebar:
 
 frames = load_market_data()
 snapshot = market_snapshot(frames)
-news_scores, news = build_news_table()
+news_scores = pd.DataFrame()
+news = pd.DataFrame()
 tech_score, tech_factors = technical_score(snapshot)
 news_score = round(news_scores["Score"].sum(), 1) if not news_scores.empty else 0
 score = round(max(min(tech_score + news_score, 10), -10), 1)
