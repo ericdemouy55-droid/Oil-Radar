@@ -239,7 +239,10 @@ with st.sidebar:
     st.write("Pour activer la synthèse IA, ajoutez `OPENAI_API_KEY` dans `.env`.")
     st.button("Rafraîchir maintenant", on_click=st.cache_data.clear)
 
-frames = load_market_data()
+with st.spinner("Chargement des données marché..."):
+    frames = load_market_data()
+    if all(df.empty for df in frames.values()):
+    st.error("Impossible de récupérer les données marché (Yahoo Finance). Réessaie dans quelques secondes.")
 snapshot = market_snapshot(frames)
 news_scores = pd.DataFrame()
 news = pd.DataFrame()
