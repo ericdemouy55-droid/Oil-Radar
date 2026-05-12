@@ -255,10 +255,22 @@ confidence = confidence_from_score(score, len(news)) if not news.empty else conf
 # Top metrics
 c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.1, 1.6])
 for col, name in zip([c1, c2, c3, c4], ["Brent", "WTI", "Dollar Index", "VIX"]):
-    row = snapshot[snapshot["Actif"] == name].iloc[0]
+for col, name in zip([c1, c2, c3, c4], ["Brent", "WTI", "Dollar Index", "VIX"]):
+    asset_rows = snapshot[snapshot["Actif"] == name]
+
+    if asset_rows.empty:
+        col.metric(name, "N/A", "N/A")
+        continue
+
+    row = asset_rows.iloc[0]
     price = row["Prix"]
     delta = row["30 min"]
-    col.metric(name, f"{price:,.2f}" if pd.notna(price) else "N/A", f"{delta:+.2f}%" if pd.notna(delta) else "N/A")
+
+    col.metric(
+        name,
+        f"{price:,.2f}" if pd.notna(price) else "N/A",
+        f"{delta:+.2f}%" if pd.notna(delta) else "N/A"
+    )
 c5.metric("Oil Bias Score", f"{score:+.1f}/10", label)
 
 st.progress(confidence / 100, text=f"Niveau de confiance indicatif : {confidence}%")
