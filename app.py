@@ -1,16 +1,13 @@
-import os
 import math
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus
+from datetime import datetime
+from io import StringIO
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from dotenv import load_dotenv
 
-load_dotenv()
 
 st.set_page_config(page_title="Oil Radar 30'", page_icon="🛢️", layout="wide")
 
@@ -23,24 +20,38 @@ STOOQ_URLS = {
     "VIX": "https://stooq.com/q/d/l/?s=vix&i=d",
 }
 
+
 @st.cache_data(ttl=60 * REFRESH_MINUTES)
 def load_market_data():
     frames = {}
 
     for name, url in STOOQ_URLS.items():
         try:
-            df = pd.read_csv(url)
+            response = requests.get(url, timeout=8)
+
+            if response.status_code != 200:
+                st.warning(f"{name}: réponse HTTP {response.status_code}")
+                frames[name] = pd.DataFrame()
+                continue
+
+            df = pd.read_csv(StringIO(response.text))
             df.columns = [c.capitalize() for c in df.columns]
 
             if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"])
+                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
                 df = df.set_index("Date")
 
             df = df.dropna()
+
+            if "Close" not in df.columns or df.empty:
+                st.warning(f"{name}: données indisponibles ou format inattendu.")
+                frames[name] = pd.DataFrame()
+                continue
+
             frames[name] = df
 
         except Exception as e:
-            st.warning(f"Erreur récupération {name}: {e}")
+            st.warning(f"{name}: erreur de récupération - {e}")
             frames[name] = pd.DataFrame()
 
     return frames
@@ -58,14 +69,16 @@ def pct_change(series, periods):
 def market_snapshot(frames):
     rows = []
 
-    for name, df in frames.items():
-        if df.empty or "Close" not in df:
+    for name in STOOQ_URLS.keys():
+        df = frames.get(name, pd.DataFrame())
+
+        if df.empty or "Close" not in df.columns:
             rows.append({
                 "Actif": name,
                 "Prix": np.nan,
-                "30 min": np.nan,
-                "4 h": np.nan,
-                "24 h": np.nan,
+                "1 jour": np.nan,
+                "5 jours": np.nan,
+                "20 jours": np.nan,
                 "Signal": "⚪ N/A"
             })
             continue
@@ -77,14 +90,14 @@ def market_snapshot(frames):
         p5 = pct_change(close, 5)
         p20 = pct_change(close, 20)
 
-        signal = "🟢" if p5 > 1 else "🔴" if p5 < -1 else "🟠"
+        signal = "🟢" if pd.notna(p5) and p5 > 1 else "🔴" if pd.notna(p5) and p5 < -1 else "🟠"
 
         rows.append({
             "Actif": name,
             "Prix": last,
-            "30 min": p1,
-            "4 h": p5,
-            "24 h": p20,
+            "1 jour": p1,
+            "5 jours": p5,
+            "20 jours": p20,
             "Signal": signal
         })
 
@@ -96,10 +109,10 @@ def technical_score(snapshot):
     factors = []
 
     try:
-        brent = float(snapshot.loc[snapshot["Actif"] == "Brent", "4 h"].iloc[0])
-        wti = float(snapshot.loc[snapshot["Actif"] == "WTI", "4 h"].iloc[0])
-        dollar = float(snapshot.loc[snapshot["Actif"] == "Dollar Index", "4 h"].iloc[0])
-        vix = float(snapshot.loc[snapshot["Actif"] == "VIX", "4 h"].iloc[0])
+        brent = float(snapshot.loc[snapshot["Actif"] == "Brent", "5 jours"].iloc[0])
+        wti = float(snapshot.loc[snapshot["Actif"] == "WTI", "5 jours"].iloc[0])
+        dollar = float(snapshot.loc[snapshot["Actif"] == "Dollar Index", "5 jours"].iloc[0])
+        vix = float(snapshot.loc[snapshot["Actif"] == "VIX", "5 jours"].iloc[0])
     except Exception:
         return 0, []
 
@@ -108,7 +121,7 @@ def technical_score(snapshot):
     if not math.isnan(oil_momentum):
         s = max(min(oil_momentum * 1.2, 3), -3)
         score += s
-        factors.append(("Momentum pétrole", round(s, 1)))
+        factors.append(("Momentum pétrole 5 jours", round(s, 1)))
 
     if not math.isnan(dollar):
         s = max(min(-dollar * 1.2, 2), -2)
@@ -143,7 +156,11 @@ def confidence_from_score(score):
 def ai_summary(score, top_factors):
     direction = "haussier" if score > 1 else "baissier" if score < -1 else "neutre"
     first = top_factors[0][0] if top_factors else "l'absence de signal dominant"
-    return f"Le marché pétrole présente un biais {direction}. Le facteur dominant détecté est {first}. À confirmer avec les prochaines données macro, stocks et événements géopolitiques."
+    return (
+        f"Le marché pétrole présente un biais {direction}. "
+        f"Le facteur dominant détecté est {first}. "
+        f"À confirmer avec les prochaines données macro, stocks et événements géopolitiques."
+    )
 
 
 st.title("🛢️ Oil Radar 30’")
@@ -157,10 +174,10 @@ with st.sidebar:
 with st.spinner("Chargement des données marché..."):
     frames = load_market_data()
 
-if all(df.empty for df in frames.values()):
-    st.error("Impossible de récupérer les données marché.")
-    
 snapshot = market_snapshot(frames)
+
+if all(df.empty for df in frames.values()):
+    st.error("Impossible de récupérer les données marché. La source Stooq ne répond pas depuis Streamlit Cloud.")
 
 tech_score, tech_factors = technical_score(snapshot)
 score = round(max(min(tech_score, 10), -10), 1)
@@ -178,7 +195,7 @@ for col, name in zip([c1, c2, c3, c4], ["Brent", "WTI", "Dollar Index", "VIX"]):
 
     row = asset_rows.iloc[0]
     price = row["Prix"]
-    delta = row["30 min"]
+    delta = row["1 jour"]
 
     col.metric(
         name,
@@ -196,7 +213,7 @@ with left:
     st.subheader("📈 Marché")
 
     show = snapshot.copy()
-    for col in ["Prix", "30 min", "4 h", "24 h"]:
+    for col in ["Prix", "1 jour", "5 jours", "20 jours"]:
         show[col] = show[col].apply(
             lambda x: f"{x:,.2f}" if pd.notna(x) and col == "Prix"
             else f"{x:+.2f}%" if pd.notna(x)
@@ -249,4 +266,7 @@ events = pd.DataFrame([
 
 st.dataframe(events, use_container_width=True, hide_index=True)
 
-st.caption(f"Dernière génération : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — Données indicatives, possiblement différées.")
+st.caption(
+    f"Dernière génération : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+    "— Données indicatives, possiblement différées."
+)
