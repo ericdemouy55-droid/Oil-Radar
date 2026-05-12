@@ -1,6 +1,5 @@
 import math
 from datetime import datetime
-from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -13,40 +12,39 @@ st.set_page_config(page_title="Oil Radar 30'", page_icon="🛢️", layout="wide
 
 REFRESH_MINUTES = 30
 
-STOOQ_URLS = {
-    "Brent": "https://stooq.com/q/d/l/?s=cb.f&i=d",
-    "WTI": "https://stooq.com/q/d/l/?s=cl.f&i=d",
-    "Dollar Index": "https://stooq.com/q/d/l/?s=dx.f&i=d",
-    "VIX": "https://stooq.com/q/d/l/?s=vix&i=d",
+YAHOO_TICKERS = {
+    "Brent": "BZ=F",
+    "WTI": "CL=F",
+    "Dollar Index": "DX-Y.NYB",
+    "VIX": "^VIX",
 }
 
 
 @st.cache_data(ttl=60 * REFRESH_MINUTES)
 def load_market_data():
     frames = {}
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    for name, url in STOOQ_URLS.items():
+    for name, ticker in YAHOO_TICKERS.items():
         try:
-            response = requests.get(url, timeout=8)
+            symbol = ticker.replace("^", "%5E").replace("=", "%3D")
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=3mo&interval=1d"
 
-            if response.status_code != 200:
-                st.warning(f"{name}: réponse HTTP {response.status_code}")
-                frames[name] = pd.DataFrame()
-                continue
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            data = response.json()
 
-            df = pd.read_csv(StringIO(response.text))
-            df.columns = [c.capitalize() for c in df.columns]
+            result = data["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            closes = result["indicators"]["quote"][0]["close"]
 
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-                df = df.set_index("Date")
+            df = pd.DataFrame({
+                "Date": pd.to_datetime(timestamps, unit="s"),
+                "Close": closes,
+            })
 
             df = df.dropna()
-
-            if "Close" not in df.columns or df.empty:
-                st.warning(f"{name}: données indisponibles ou format inattendu.")
-                frames[name] = pd.DataFrame()
-                continue
+            df = df.set_index("Date")
 
             frames[name] = df
 
@@ -69,7 +67,7 @@ def pct_change(series, periods):
 def market_snapshot(frames):
     rows = []
 
-    for name in STOOQ_URLS.keys():
+    for name in YAHOO_TICKERS.keys():
         df = frames.get(name, pd.DataFrame())
 
         if df.empty or "Close" not in df.columns:
@@ -79,7 +77,7 @@ def market_snapshot(frames):
                 "1 jour": np.nan,
                 "5 jours": np.nan,
                 "20 jours": np.nan,
-                "Signal": "⚪ N/A"
+                "Signal": "⚪ N/A",
             })
             continue
 
@@ -98,7 +96,7 @@ def market_snapshot(frames):
             "1 jour": p1,
             "5 jours": p5,
             "20 jours": p20,
-            "Signal": signal
+            "Signal": signal,
         })
 
     return pd.DataFrame(rows)
@@ -168,7 +166,7 @@ st.caption("Cockpit pétrole en une page — données indicatives, actualisation
 
 with st.sidebar:
     st.header("Paramètres")
-    st.write("La V1 utilise Stooq pour les prix. Les news sont temporairement désactivées.")
+    st.write("La V1 utilise Yahoo Finance direct pour les prix. Les news sont temporairement désactivées.")
     st.button("Rafraîchir maintenant", on_click=st.cache_data.clear)
 
 with st.spinner("Chargement des données marché..."):
@@ -177,7 +175,7 @@ with st.spinner("Chargement des données marché..."):
 snapshot = market_snapshot(frames)
 
 if all(df.empty for df in frames.values()):
-    st.error("Impossible de récupérer les données marché. La source Stooq ne répond pas depuis Streamlit Cloud.")
+    st.error("Impossible de récupérer les données marché depuis Yahoo Finance.")
 
 tech_score, tech_factors = technical_score(snapshot)
 score = round(max(min(tech_score, 10), -10), 1)
@@ -200,7 +198,7 @@ for col, name in zip([c1, c2, c3, c4], ["Brent", "WTI", "Dollar Index", "VIX"]):
     col.metric(
         name,
         f"{price:,.2f}" if pd.notna(price) else "N/A",
-        f"{delta:+.2f}%" if pd.notna(delta) else "N/A"
+        f"{delta:+.2f}%" if pd.notna(delta) else "N/A",
     )
 
 c5.metric("Oil Bias Score", f"{score:+.1f}/10", label)
@@ -230,7 +228,7 @@ with left:
             height=260,
             margin=dict(l=10, r=10, t=20, b=10),
             xaxis_title=None,
-            yaxis_title="Brent"
+            yaxis_title="Brent",
         )
         st.plotly_chart(fig, use_container_width=True)
 
