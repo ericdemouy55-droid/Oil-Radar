@@ -255,7 +255,6 @@ confidence = confidence_from_score(score, len(news)) if not news.empty else conf
 # Top metrics
 c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.1, 1.6])
 for col, name in zip([c1, c2, c3, c4], ["Brent", "WTI", "Dollar Index", "VIX"]):
-for col, name in zip([c1, c2, c3, c4], ["Brent", "WTI", "Dollar Index", "VIX"]):
     asset_rows = snapshot[snapshot["Actif"] == name]
 
     if asset_rows.empty:
