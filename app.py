@@ -1,371 +1,655 @@
-import math
+import os
+import re
+import requests
+import feedparser
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import streamlit as st
 from datetime import datetime
 
-import feedparser
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import requests
-import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+# ============================================================
+# CONFIG
+# ============================================================
 
+st.set_page_config(
+    page_title="Oil Trading Desk",
+    page_icon="🛢️",
+    layout="wide"
+)
 
-st.set_page_config(page_title="Oil Radar 5'", page_icon="🛢️", layout="wide")
+REFRESH_SECONDS = 300  # 5 minutes
+DAILY_INVESTMENT = 1000
+INITIAL_CAPITAL = 10000
+PAPER_TRADES_FILE = "paper_trades.csv"
 
-REFRESH_MINUTES = 5
+WTI_TICKER = "CL=F"
+BRENT_TICKER = "BZ=F"
 
-st_autorefresh(interval=REFRESH_MINUTES * 60 * 1000, key="oil_radar_refresh")
-
-YAHOO_TICKERS = {
-    "Brent": "BZ=F",
-    "WTI": "CL=F",
-    "Dollar Index": "DX-Y.NYB",
-    "VIX": "^VIX",
-}
-
-RSS_FEEDS = [
-    "https://oilprice.com/rss/main",
-    "https://www.eia.gov/rss/todayinenergy.xml",
-    "https://www.reutersagency.com/feed/?best-topics=energy&post_type=best",
+NEWS_FEEDS = [
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://www.investing.com/rss/news_25.rss",
+    "https://www.oilprice.com/rss/main",
 ]
 
-NEWS_RULES = {
-    "bullish": {
-        "keywords": [
-            "iran", "hormuz", "attack", "missile", "houthi", "sanction",
-            "supply disruption", "production cut", "opec cut", "inventory draw",
-            "stocks fall", "crude draw", "refinery outage", "war", "tension"
-        ],
-        "score": 1.5,
-    },
-    "bearish": {
-        "keywords": [
-            "inventory build", "stocks rise", "demand weak", "slowdown",
-            "china weak", "recession", "output increase", "production increase",
-            "ceasefire", "surplus", "dollar strengthens", "rate hike"
-        ],
-        "score": -1.5,
-    },
-}
+# ============================================================
+# AUTO REFRESH
+# ============================================================
+
+st.markdown(
+    f"""
+    <meta http-equiv="refresh" content="{REFRESH_SECONDS}">
+    """,
+    unsafe_allow_html=True
+)
+
+# ============================================================
+# Pushover optional
+# ============================================================
+
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
+PUSHOVER_USER = os.getenv("PUSHOVER_USER", "")
 
 
-@st.cache_data(ttl=60 * REFRESH_MINUTES)
-def load_market_data():
-    frames = {}
-    headers = {"User-Agent": "Mozilla/5.0"}
+def send_pushover(title, message):
+    if not PUSHOVER_TOKEN or not PUSHOVER_USER:
+        return False
 
-    for name, ticker in YAHOO_TICKERS.items():
+    try:
+        requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token": PUSHOVER_TOKEN,
+                "user": PUSHOVER_USER,
+                "title": title,
+                "message": message,
+            },
+            timeout=10
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# MARKET DATA
+# ============================================================
+
+def get_oil_data(ticker, period="5d", interval="15m"):
+    data = yf.download(
+        ticker,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=True
+    )
+
+    if data.empty:
+        return pd.DataFrame()
+
+    data = data.reset_index()
+    return data
+
+
+def get_last_price(data):
+    if data.empty:
+        return None
+    return float(data["Close"].iloc[-1])
+
+
+def calculate_technical_score(data):
+    if data.empty or len(data) < 30:
+        return 0, {}
+
+    df = data.copy()
+    close = df["Close"]
+
+    last_price = float(close.iloc[-1])
+    sma_20 = float(close.rolling(20).mean().iloc[-1])
+    sma_50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else sma_20
+
+    momentum = (last_price - float(close.iloc[-10])) / float(close.iloc[-10]) * 100
+
+    volatility = close.pct_change().rolling(20).std().iloc[-1] * 100
+    volatility = float(volatility) if not np.isnan(volatility) else 0
+
+    score = 0
+
+    if last_price > sma_20:
+        score += 1
+    else:
+        score -= 1
+
+    if last_price > sma_50:
+        score += 1
+    else:
+        score -= 1
+
+    if momentum > 0.3:
+        score += 1
+    elif momentum < -0.3:
+        score -= 1
+
+    if volatility > 1.5:
+        score -= 0.5
+
+    details = {
+        "last_price": last_price,
+        "sma_20": sma_20,
+        "sma_50": sma_50,
+        "momentum_pct": momentum,
+        "volatility_pct": volatility,
+    }
+
+    return score, details
+
+
+# ============================================================
+# NEWS ANALYSIS
+# ============================================================
+
+BULLISH_KEYWORDS = [
+    "attack", "war", "conflict", "iran", "israel", "russia",
+    "sanctions", "supply cut", "production cut", "opec cut",
+    "disruption", "pipeline", "refinery fire", "inventory draw",
+    "crude draw", "tight supply", "shortage"
+]
+
+BEARISH_KEYWORDS = [
+    "inventory build", "crude build", "demand weak", "weak demand",
+    "recession", "slowdown", "oversupply", "production increase",
+    "opec output rise", "ceasefire", "peace deal", "demand concerns"
+]
+
+STRONG_NEWS_KEYWORDS = [
+    "iran", "israel", "opec", "russia", "sanctions", "attack",
+    "war", "strike", "inventory", "eia", "supply cut",
+    "production cut", "pipeline", "refinery"
+]
+
+
+def clean_text(text):
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def fetch_news(max_items=20):
+    articles = []
+
+    for feed_url in NEWS_FEEDS:
         try:
-            symbol = ticker.replace("^", "%5E").replace("=", "%3D")
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=3mo&interval=1d"
+            feed = feedparser.parse(feed_url)
 
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            result = data["chart"]["result"][0]
-            timestamps = result["timestamp"]
-            closes = result["indicators"]["quote"][0]["close"]
-
-            df = pd.DataFrame({
-                "Date": pd.to_datetime(timestamps, unit="s"),
-                "Close": closes,
-            })
-
-            df = df.dropna()
-            df = df.set_index("Date")
-            frames[name] = df
-
-        except Exception as e:
-            st.warning(f"{name}: erreur récupération - {e}")
-            frames[name] = pd.DataFrame()
-
-    return frames
-
-
-@st.cache_data(ttl=60 * REFRESH_MINUTES)
-def load_news():
-    rows = []
-
-    for feed in RSS_FEEDS:
-        try:
-            parsed = feedparser.parse(feed)
-
-            for entry in parsed.entries[:10]:
-                title = entry.get("title", "")
+            for entry in feed.entries[:max_items]:
+                title = clean_text(entry.get("title", ""))
                 link = entry.get("link", "")
-                source = feed
+                published = entry.get("published", "")
 
                 if title:
-                    rows.append({
+                    articles.append({
                         "title": title,
                         "link": link,
-                        "source": source,
+                        "published": published
                     })
 
         except Exception:
             continue
 
-    return pd.DataFrame(rows).drop_duplicates(subset=["title"])
+    seen = set()
+    unique_articles = []
+
+    for article in articles:
+        if article["title"] not in seen:
+            unique_articles.append(article)
+            seen.add(article["title"])
+
+    return unique_articles[:max_items]
 
 
-def pct_change(series, periods):
-    try:
-        if len(series) <= periods:
-            return np.nan
-        return (series.iloc[-1] / series.iloc[-1 - periods] - 1) * 100
-    except Exception:
-        return np.nan
+def analyze_news_sentiment(articles):
+    score = 0
+    strong_news = []
 
+    for article in articles:
+        title = article["title"].lower()
 
-def market_snapshot(frames):
-    rows = []
+        impact = 0
 
-    for name in YAHOO_TICKERS.keys():
-        df = frames.get(name, pd.DataFrame())
+        for word in BULLISH_KEYWORDS:
+            if word in title:
+                score += 1
+                impact += 1
 
-        if df.empty or "Close" not in df.columns:
-            rows.append({
-                "Actif": name,
-                "Prix": np.nan,
-                "1 jour": np.nan,
-                "5 jours": np.nan,
-                "20 jours": np.nan,
-                "Signal": "⚪ N/A",
+        for word in BEARISH_KEYWORDS:
+            if word in title:
+                score -= 1
+                impact += 1
+
+        for word in STRONG_NEWS_KEYWORDS:
+            if word in title:
+                impact += 1
+
+        if impact >= 2:
+            strong_news.append({
+                "title": article["title"],
+                "impact": impact,
+                "link": article["link"]
             })
-            continue
 
-        close = df["Close"].dropna()
-        last = close.iloc[-1]
-        p1 = pct_change(close, 1)
-        p5 = pct_change(close, 5)
-        p20 = pct_change(close, 20)
-
-        signal = "🟢" if pd.notna(p5) and p5 > 1 else "🔴" if pd.notna(p5) and p5 < -1 else "🟠"
-
-        rows.append({
-            "Actif": name,
-            "Prix": last,
-            "1 jour": p1,
-            "5 jours": p5,
-            "20 jours": p20,
-            "Signal": signal,
-        })
-
-    return pd.DataFrame(rows)
+    news_score = max(min(score, 4), -4)
+    return news_score, strong_news
 
 
-def technical_score(snapshot):
-    score = 0.0
-    factors = []
+# ============================================================
+# OIL BIAS SCORE
+# ============================================================
 
-    try:
-        brent = float(snapshot.loc[snapshot["Actif"] == "Brent", "5 jours"].iloc[0])
-        wti = float(snapshot.loc[snapshot["Actif"] == "WTI", "5 jours"].iloc[0])
-        dollar = float(snapshot.loc[snapshot["Actif"] == "Dollar Index", "5 jours"].iloc[0])
-        vix = float(snapshot.loc[snapshot["Actif"] == "VIX", "5 jours"].iloc[0])
-    except Exception:
-        return 0, []
-
-    oil_momentum = np.nanmean([brent, wti])
-
-    if not math.isnan(oil_momentum):
-        s = max(min(oil_momentum * 1.2, 3), -3)
-        score += s
-        factors.append(("Momentum pétrole 5 jours", round(s, 1)))
-
-    if not math.isnan(dollar):
-        s = max(min(-dollar * 1.2, 2), -2)
-        score += s
-        factors.append(("Dollar Index", round(s, 1)))
-
-    if not math.isnan(vix):
-        s = max(min(vix * 0.25, 1.5), -1.5)
-        score += s
-        factors.append(("Stress marché / VIX", round(s, 1)))
-
-    return round(score, 1), factors
+def calculate_oil_bias_score(technical_score, news_score):
+    final_score = technical_score + news_score
+    final_score = max(min(final_score, 10), -10)
+    return round(final_score, 1)
 
 
-def news_sentiment_score(news):
-    score = 0.0
-    factors = []
-
-    if news.empty:
-        return 0.0, []
-
-    for _, row in news.iterrows():
-        title = str(row["title"]).lower()
-
-        for keyword in NEWS_RULES["bullish"]["keywords"]:
-            if keyword in title:
-                score += NEWS_RULES["bullish"]["score"]
-                factors.append((f"News haussière: {keyword}", NEWS_RULES["bullish"]["score"]))
-                break
-
-        for keyword in NEWS_RULES["bearish"]["keywords"]:
-            if keyword in title:
-                score += NEWS_RULES["bearish"]["score"]
-                factors.append((f"News baissière: {keyword}", NEWS_RULES["bearish"]["score"]))
-                break
-
-    score = max(min(score, 4), -4)
-    return round(score, 1), factors[:6]
-
-
-def label_from_score(score):
-    if score >= 6:
-        return "🟢 BIAIS HAUSSIER FORT"
+def get_signal(score):
     if score >= 2:
-        return "🟢 BIAIS HAUSSIER"
-    if score <= -6:
-        return "🔴 BIAIS BAISSIER FORT"
-    if score <= -2:
-        return "🔴 BIAIS BAISSIER"
+        return "BUY"
+    elif score <= -2:
+        return "SELL"
+    return "HOLD"
+
+
+def get_signal_label(score):
+    if score >= 4:
+        return "🟢 HAUSSIER FORT"
+    elif score >= 2:
+        return "🟢 HAUSSIER MODÉRÉ"
+    elif score <= -4:
+        return "🔴 BAISSIER FORT"
+    elif score <= -2:
+        return "🔴 BAISSIER MODÉRÉ"
     return "🟠 NEUTRE / ATTENTE"
 
 
-def confidence_from_score(score, news_count):
-    base = min(abs(score) / 10, 1) * 55 + min(news_count / 20, 1) * 25 + 20
-    return int(max(20, min(90, base)))
+# ============================================================
+# PAPER TRADING
+# ============================================================
+
+def init_paper_trading_file():
+    if not os.path.exists(PAPER_TRADES_FILE):
+        df = pd.DataFrame(columns=[
+            "date",
+            "open_time",
+            "close_time",
+            "signal",
+            "entry_price",
+            "exit_price",
+            "invested_amount",
+            "quantity",
+            "pnl_eur",
+            "pnl_pct",
+            "capital_after_trade",
+            "oil_bias_score",
+            "main_news",
+            "status"
+        ])
+        df.to_csv(PAPER_TRADES_FILE, index=False)
 
 
-def ai_summary(score, top_factors):
-    direction = "haussier" if score > 1 else "baissier" if score < -1 else "neutre"
-    first = top_factors[0][0] if top_factors else "l'absence de signal dominant"
-
-    return (
-        f"Le marché pétrole présente un biais {direction}. "
-        f"Le facteur dominant détecté est {first}. "
-        f"À confirmer avec les prochaines données macro, stocks et événements géopolitiques."
-    )
+def load_trades():
+    init_paper_trading_file()
+    return pd.read_csv(PAPER_TRADES_FILE)
 
 
-st.title("🛢️ Oil Radar 5’")
-st.caption("Cockpit pétrole en une page — refresh automatique toutes les 5 minutes")
+def save_trades(df):
+    df.to_csv(PAPER_TRADES_FILE, index=False)
 
-with st.sidebar:
-    st.header("Paramètres")
-    st.write("Prix : Yahoo Finance direct")
-    st.write("News : flux RSS énergie")
-    st.write("Score : technique + sentiment news")
-    st.button("Rafraîchir maintenant", on_click=st.cache_data.clear)
 
-with st.spinner("Chargement des données marché..."):
-    frames = load_market_data()
+def get_current_capital():
+    df = load_trades()
+    closed = df[df["status"] == "CLOSED"]
 
-news = load_news()
-snapshot = market_snapshot(frames)
+    if closed.empty:
+        return INITIAL_CAPITAL
 
-if all(df.empty for df in frames.values()):
-    st.error("Impossible de récupérer les données marché depuis Yahoo Finance.")
+    return float(closed.iloc[-1]["capital_after_trade"])
 
-tech_score, tech_factors = technical_score(snapshot)
-news_score, news_factors = news_sentiment_score(news)
 
-score = round(max(min(tech_score + news_score, 10), -10), 1)
-label = label_from_score(score)
-confidence = confidence_from_score(score, len(news))
+def has_open_trade():
+    df = load_trades()
+    return not df[df["status"] == "OPEN"].empty
 
-c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.1, 1.1, 1.6])
 
-for col, name in zip([c1, c2, c3, c4], ["Brent", "WTI", "Dollar Index", "VIX"]):
-    asset_rows = snapshot[snapshot["Actif"] == name]
+def open_paper_trade(signal, current_price, oil_bias_score, main_news):
+    df = load_trades()
 
-    if asset_rows.empty:
-        col.metric(name, "N/A", "N/A")
-        continue
+    if has_open_trade():
+        return False, "Une position est déjà ouverte."
 
-    row = asset_rows.iloc[0]
-    price = row["Prix"]
-    delta = row["1 jour"]
+    if signal not in ["BUY", "SELL"]:
+        return False, "Signal neutre : aucune position ouverte."
 
-    col.metric(
-        name,
-        f"{price:,.2f}" if pd.notna(price) else "N/A",
-        f"{delta:+.2f}%" if pd.notna(delta) else "N/A",
-    )
+    capital = get_current_capital()
 
-c5.metric("Oil Bias Score", f"{score:+.1f}/10", label)
+    if capital < DAILY_INVESTMENT:
+        return False, "Capital insuffisant."
 
-st.progress(confidence / 100, text=f"Niveau de confiance indicatif : {confidence}%")
+    quantity = DAILY_INVESTMENT / current_price
 
-left, center, right = st.columns([1.15, 1.15, 1])
+    new_trade = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "open_time": datetime.now().strftime("%H:%M:%S"),
+        "close_time": "",
+        "signal": signal,
+        "entry_price": round(current_price, 4),
+        "exit_price": "",
+        "invested_amount": DAILY_INVESTMENT,
+        "quantity": quantity,
+        "pnl_eur": "",
+        "pnl_pct": "",
+        "capital_after_trade": "",
+        "oil_bias_score": oil_bias_score,
+        "main_news": main_news,
+        "status": "OPEN"
+    }
 
-with left:
-    st.subheader("📈 Marché")
+    df = pd.concat([df, pd.DataFrame([new_trade])], ignore_index=True)
+    save_trades(df)
 
-    show = snapshot.copy()
-    for col in ["Prix", "1 jour", "5 jours", "20 jours"]:
-        show[col] = show[col].apply(
-            lambda x: f"{x:,.2f}" if pd.notna(x) and col == "Prix"
-            else f"{x:+.2f}%" if pd.notna(x)
-            else "N/A"
+    return True, f"Position virtuelle ouverte : {signal} à {current_price:.2f}$"
+
+
+def close_paper_trade(current_price):
+    df = load_trades()
+    open_positions = df[df["status"] == "OPEN"]
+
+    if open_positions.empty:
+        return False, "Aucune position ouverte."
+
+    index = open_positions.index[-1]
+    trade = df.loc[index]
+
+    entry_price = float(trade["entry_price"])
+    quantity = float(trade["quantity"])
+    signal = trade["signal"]
+
+    if signal == "BUY":
+        pnl_eur = (current_price - entry_price) * quantity
+        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+    elif signal == "SELL":
+        pnl_eur = (entry_price - current_price) * quantity
+        pnl_pct = ((entry_price - current_price) / entry_price) * 100
+    else:
+        return False, "Signal invalide."
+
+    previous_capital = get_current_capital()
+    capital_after_trade = previous_capital + pnl_eur
+
+    df.at[index, "close_time"] = datetime.now().strftime("%H:%M:%S")
+    df.at[index, "exit_price"] = round(current_price, 4)
+    df.at[index, "pnl_eur"] = round(pnl_eur, 2)
+    df.at[index, "pnl_pct"] = round(pnl_pct, 2)
+    df.at[index, "capital_after_trade"] = round(capital_after_trade, 2)
+    df.at[index, "status"] = "CLOSED"
+
+    save_trades(df)
+
+    return True, f"Position clôturée. Résultat : {pnl_eur:.2f}€"
+
+
+# ============================================================
+# UI
+# ============================================================
+
+st.title("🛢️ Oil Trading Desk — Simulation virtuelle")
+
+st.caption("Dashboard pétrole avec Oil Bias Score, news impactantes et paper trading 1000€ / jour.")
+
+wti_data = get_oil_data(WTI_TICKER)
+brent_data = get_oil_data(BRENT_TICKER)
+
+wti_price = get_last_price(wti_data)
+brent_price = get_last_price(brent_data)
+
+if wti_price is None:
+    st.error("Impossible de récupérer le prix du WTI.")
+    st.stop()
+
+technical_score, technical_details = calculate_technical_score(wti_data)
+
+articles = fetch_news()
+news_score, strong_news = analyze_news_sentiment(articles)
+
+oil_bias_score = calculate_oil_bias_score(technical_score, news_score)
+signal = get_signal(oil_bias_score)
+signal_label = get_signal_label(oil_bias_score)
+
+main_news = strong_news[0]["title"] if strong_news else "Aucune news forte détectée"
+
+# ============================================================
+# TOP METRICS
+# ============================================================
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric("WTI", f"{wti_price:.2f} $")
+
+with col2:
+    if brent_price:
+        st.metric("Brent", f"{brent_price:.2f} $")
+    else:
+        st.metric("Brent", "N/A")
+
+with col3:
+    st.metric("Oil Bias Score", f"{oil_bias_score}/10")
+
+with col4:
+    st.metric("Signal", signal)
+
+st.subheader(signal_label)
+
+# ============================================================
+# CHART
+# ============================================================
+
+st.write("### 📈 Prix WTI")
+
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(
+    x=wti_data[wti_data.columns[0]],
+    y=wti_data["Close"],
+    mode="lines",
+    name="WTI"
+))
+
+fig.update_layout(
+    height=420,
+    margin=dict(l=20, r=20, t=30, b=20),
+    xaxis_title="Temps",
+    yaxis_title="Prix $"
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================
+# SCORE DETAILS
+# ============================================================
+
+st.write("### 🧠 Détail du score")
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    st.metric("Score technique", technical_score)
+
+with c2:
+    st.metric("Score news", news_score)
+
+with c3:
+    st.metric("Décision", signal)
+
+with st.expander("Voir les détails techniques"):
+    st.json(technical_details)
+
+# ============================================================
+# STRONG NEWS
+# ============================================================
+
+st.write("### 🚨 News fortes détectées")
+
+if strong_news:
+    st.error("Une ou plusieurs news potentiellement impactantes ont été détectées.")
+
+    for news in strong_news[:5]:
+        st.write(f"**Impact {news['impact']}** — {news['title']}")
+        if news["link"]:
+            st.write(news["link"])
+
+    if st.button("📲 Envoyer une notification Pushover"):
+        sent = send_pushover(
+            "🚨 Oil Alert",
+            strong_news[0]["title"]
         )
 
-    st.dataframe(show, use_container_width=True, hide_index=True)
+        if sent:
+            st.success("Notification envoyée.")
+        else:
+            st.warning("Pushover non configuré ou erreur d’envoi.")
+else:
+    st.info("Aucune news forte détectée pour le moment.")
 
-    if "Brent" in frames and not frames["Brent"].empty:
-        df = frames["Brent"].tail(90).copy()
+# ============================================================
+# NEWS LIST
+# ============================================================
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines", name="Brent"))
-        fig.update_layout(
-            height=260,
-            margin=dict(l=10, r=10, t=20, b=10),
-            xaxis_title=None,
-            yaxis_title="Brent",
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-with center:
-    st.subheader("🧠 Facteurs de score")
-
-    factor_rows = [{"Facteur": k, "Score": v} for k, v in tech_factors]
-    factor_rows.extend([{"Facteur": k, "Score": v} for k, v in news_factors])
-
-    factors_df = pd.DataFrame(factor_rows)
-
-    st.metric("Score technique", f"{tech_score:+.1f}")
-    st.metric("Score news", f"{news_score:+.1f}")
-
-    if not factors_df.empty:
-        factors_df = factors_df.sort_values("Score", key=lambda s: s.abs(), ascending=False)
-        st.dataframe(factors_df, use_container_width=True, hide_index=True)
+with st.expander("📰 Voir toutes les news"):
+    if articles:
+        for article in articles:
+            st.write(f"- **{article['title']}**")
+            if article["link"]:
+                st.write(article["link"])
     else:
-        st.info("Pas assez de données pour scorer.")
+        st.write("Aucune news disponible.")
 
-    st.subheader("🧾 Synthèse")
-    top_factors = [(r["Facteur"], r["Score"]) for _, r in factors_df.head(5).iterrows()] if not factors_df.empty else []
-    st.success(ai_summary(score, top_factors))
+# ============================================================
+# PAPER TRADING UI
+# ============================================================
 
-with right:
-    st.subheader("⚡ Top impact news")
+st.write("---")
+st.header("🧪 Paper Trading — 1000€ virtuels par jour")
 
-    if news.empty:
-        st.warning("Aucune news récupérée.")
-    else:
-        for _, row in news.head(10).iterrows():
-            st.markdown(
-                f"**{row['title']}**  \n"
-                f"[Lire l’article]({row['link']})"
+df_trades = load_trades()
+current_capital = get_current_capital()
+
+p1, p2, p3 = st.columns(3)
+
+with p1:
+    st.metric("Capital simulé", f"{current_capital:,.2f} €")
+
+with p2:
+    total_perf = current_capital - INITIAL_CAPITAL
+    st.metric("Performance totale", f"{total_perf:,.2f} €")
+
+with p3:
+    st.metric("Mise journalière", f"{DAILY_INVESTMENT} €")
+
+open_positions = df_trades[df_trades["status"] == "OPEN"]
+
+if not open_positions.empty:
+    st.warning("📌 Une position virtuelle est actuellement ouverte.")
+
+    trade = open_positions.iloc[-1]
+
+    st.write(f"**Signal :** {trade['signal']}")
+    st.write(f"**Prix d’entrée :** {trade['entry_price']}")
+    st.write(f"**Montant investi :** {trade['invested_amount']} €")
+    st.write(f"**Heure d’ouverture :** {trade['open_time']}")
+    st.write(f"**News principale :** {trade['main_news']}")
+
+    if st.button("🔒 Clôturer la position maintenant"):
+        success, message = close_paper_trade(wti_price)
+
+        if success:
+            st.success(message)
+            st.rerun()
+        else:
+            st.error(message)
+
+else:
+    st.info("Aucune position ouverte actuellement.")
+
+    if signal in ["BUY", "SELL"]:
+        if st.button(f"🚀 Ouvrir une position virtuelle {signal} de 1000€"):
+            success, message = open_paper_trade(
+                signal=signal,
+                current_price=wti_price,
+                oil_bias_score=oil_bias_score,
+                main_news=main_news
             )
-            st.divider()
 
-st.subheader("🕒 Next risk events")
+            if success:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
+    else:
+        st.warning("Signal neutre : aucune position recommandée pour le moment.")
 
-events = pd.DataFrame([
-    {"Quand": "Mercredi 16:30 Paris", "Événement": "Stocks EIA US", "Risque": "Très fort sur WTI / Brent"},
-    {"Quand": "Mardi soir / nuit", "Événement": "API Weekly Statistical Bulletin", "Risque": "Signal préliminaire stocks US"},
-    {"Quand": "Selon calendrier", "Événement": "OPEP / OPEP+", "Risque": "Production / quotas / discipline"},
-    {"Quand": "Mensuel", "Événement": "CPI US / Fed / Dollar", "Risque": "Dollar et appétit pour le risque"},
-    {"Quand": "Mensuel", "Événement": "PMI Chine", "Risque": "Demande mondiale"},
-])
+# ============================================================
+# TRADING HISTORY
+# ============================================================
 
-st.dataframe(events, use_container_width=True, hide_index=True)
+st.write("### 📊 Historique des trades")
 
+if df_trades.empty:
+    st.info("Aucun trade enregistré.")
+else:
+    st.dataframe(
+        df_trades.sort_values(by=["date", "open_time"], ascending=False),
+        use_container_width=True
+    )
+
+    closed = df_trades[df_trades["status"] == "CLOSED"].copy()
+
+    if not closed.empty:
+        closed["capital_after_trade"] = pd.to_numeric(
+            closed["capital_after_trade"],
+            errors="coerce"
+        )
+
+        closed["pnl_eur"] = pd.to_numeric(
+            closed["pnl_eur"],
+            errors="coerce"
+        )
+
+        st.write("### 📈 Courbe du capital")
+
+        chart_df = closed[["date", "capital_after_trade"]].dropna()
+        chart_df = chart_df.set_index("date")
+
+        st.line_chart(chart_df)
+
+        winning_trades = closed[closed["pnl_eur"] > 0]
+        win_rate = len(winning_trades) / len(closed) * 100
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.metric("Trades clôturés", len(closed))
+
+        with c2:
+            st.metric("Trades gagnants", len(winning_trades))
+
+        with c3:
+            st.metric("Taux de réussite", f"{win_rate:.1f}%")
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.write("---")
 st.caption(
-    f"Dernière génération : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
-    "— Données indicatives, possiblement différées."
+    "Simulation uniquement. Ce dashboard ne constitue pas un conseil financier. "
+    "Rafraîchissement automatique toutes les 5 minutes."
 )
