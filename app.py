@@ -106,7 +106,12 @@ def load_news():
         except Exception:
             continue
 
-    return pd.DataFrame(rows).drop_duplicates(subset=["title"])
+df = pd.DataFrame(rows)
+
+if df.empty:
+    return pd.DataFrame(columns=["title", "link", "source"])
+
+return df.drop_duplicates(subset=["title"])
 
 
 def pct_change(series, periods):
